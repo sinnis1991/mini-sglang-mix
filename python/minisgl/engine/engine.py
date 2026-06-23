@@ -21,8 +21,8 @@ logger = init_logger(__name__)
 
 
 class ForwardOutput(NamedTuple):
-    next_tokens_gpu: torch.Tensor
-    next_tokens_cpu: torch.Tensor
+    next_tokens_gpu: torch.Tensor | None
+    next_tokens_cpu: torch.Tensor | None
     copy_done_event: torch.cuda.Event
 
 
@@ -196,14 +196,13 @@ class Engine:
             else:
                 logits = self.model.forward()
 
-        for req in batch.reqs:
+        for i, req in enumerate(batch.reqs):
             req.complete_one()
+            req.logits = logits[i : i + 1]
 
-        next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(None, None, copy_done_event)
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
