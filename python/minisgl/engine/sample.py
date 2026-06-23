@@ -51,7 +51,10 @@ class Sampler:
     vocab_size: int
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
-        params = [r.sampling_params for r in batch.reqs]
+        return self.prepare_reqs(batch.reqs)
+
+    def prepare_reqs(self, reqs) -> BatchSamplingArgs:
+        params = [r.sampling_params for r in reqs]
         if all(p.is_greedy for p in params):
             return BatchSamplingArgs(temperatures=None)
 

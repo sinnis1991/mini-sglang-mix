@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
 from minisgl.core import Batch, Req
@@ -9,7 +9,6 @@ from minisgl.message import (
     AbortBackendMsg,
     BaseBackendMsg,
     BatchBackendMsg,
-    DetokenizeMsg,
     ExitMsg,
     UserMsg,
 )
@@ -20,6 +19,7 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
+from .sample import SampleManager
 from .table import TableManager
 
 if TYPE_CHECKING:
@@ -63,6 +63,7 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        self.sample_manager = SampleManager()
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
@@ -89,6 +90,7 @@ class Scheduler(SchedulerIOMixin):
         """
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
+            or self.sample_manager.runnable
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
         )
@@ -106,7 +108,9 @@ class Scheduler(SchedulerIOMixin):
         return ongoing_data
 
     def normal_loop(self) -> None:
-        blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
+        blocking = not (
+            self.sample_manager.runnable or self.prefill_manager.runnable or self.decode_manager.runnable
+        )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
@@ -139,32 +143,9 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, (_, _, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
-        reply: List[DetokenizeMsg] = []
-        new_finished_reqs: Set[Req] = set()
-        with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
-                    continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                finished = not req.can_decode
-                if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
-
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
-                    self.cache_manager.cache_req(req, finished=False)
-
-        self.finished_reqs = new_finished_reqs
-        self.send_result(reply)
+        self.sample_manager.add_reqs(req for req in batch.reqs if not isinstance(req, ChunkedReq))
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -190,6 +171,7 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
+            req_to_free = req_to_free or self.sample_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
@@ -217,6 +199,7 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
+        self.sample_manager.sample_first(self)
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
@@ -228,8 +211,13 @@ class Scheduler(SchedulerIOMixin):
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        if forward_output.next_tokens_gpu is not None:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        for req in forward_input.batch.reqs:
+            if req.logits is not None:
+                self.decode_manager.remove_req(req)
+            else:
+                self.decode_manager.add_req(req)
         return forward_output
 
 

@@ -14,6 +14,10 @@ class DecodeManager:
     def filter_reqs(self, reqs: Iterable[Req]) -> None:
         self.running_reqs = {req for req in self.running_reqs.union(reqs) if req.can_decode}
 
+    def add_req(self, req: Req) -> None:
+        if req.can_decode:
+            self.running_reqs.add(req)
+
     def remove_req(self, req: Req) -> None:
         self.running_reqs.discard(req)
 
