@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
 from minisgl.distributed import get_tp_info
+from minisgl.utils import device as accel
 from minisgl.utils import init_logger
 from tqdm import tqdm
 
@@ -72,13 +73,13 @@ def mem_GB(size: int) -> str:
 
 
 def get_free_memory(device: torch.device) -> int:
-    return torch.cuda.mem_get_info(device)[0]
+    return accel.mem_get_info(device)[0]
 
 
 class GraphRunner:
     def __init__(
         self,
-        stream: torch.cuda.Stream,
+        stream,
         device: torch.device,
         model: BaseLLMModel,
         attn_backend: BaseAttnBackend,
@@ -103,15 +104,20 @@ class GraphRunner:
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
-        self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.graph_map: Dict[int, object] = {}
+        if accel.is_npu():
+            self.max_graph_bs = 0
+            self.graph_bs_list = []
+            return logger.info_rank0("CUDA graph is disabled on Ascend NPU.")
+
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
 
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
+        accel.synchronize(self.device)
+        accel.empty_cache()
+        accel.reset_peak_memory_stats(self.device)
 
         logger.info_rank0(f"Start capturing CUDA graphs with sizes: {self.graph_bs_list}")
         free_memory = get_free_memory(self.device)

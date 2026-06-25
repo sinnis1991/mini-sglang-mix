@@ -11,6 +11,7 @@ from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
+from minisgl.utils import device as accel
 from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
 from .config import EngineConfig
@@ -23,20 +24,20 @@ logger = init_logger(__name__)
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor | None
     next_tokens_cpu: torch.Tensor | None
-    copy_done_event: torch.cuda.Event
+    copy_done_event: accel.Event
 
 
 class Engine:
     def __init__(self, config: EngineConfig):
-        assert not torch.cuda.is_initialized()
+        assert accel.is_npu() or not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
-        torch.cuda.set_device(self.device)
+        self.device = accel.make_device(config.tp_info.rank)
+        accel.set_device(self.device)
         torch.manual_seed(42)
-        self.stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self.stream)
+        self.stream = accel.Stream()
+        accel.set_stream(self.stream)
         self.dtype = config.dtype
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
@@ -169,9 +170,9 @@ class Engine:
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
+        accel.synchronize(self.device)
+        accel.empty_cache()
+        accel.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
@@ -189,7 +190,7 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        assert torch.cuda.current_stream() == self.stream
+        assert accel.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
@@ -200,7 +201,7 @@ class Engine:
             req.complete_one()
             req.logits = logits[i : i + 1]
 
-        copy_done_event = torch.cuda.Event()
+        copy_done_event = accel.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(None, None, copy_done_event)
 
