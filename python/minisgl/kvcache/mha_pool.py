@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from minisgl.distributed import get_tp_info
+from minisgl.utils import device as accel
 from minisgl.utils import div_even
 
 from .base import BaseKVCachePool
@@ -45,11 +46,19 @@ class MHAKVCache(BaseKVCachePool):
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
+        k_cache = self._k_buffer[layer_id].view(self._storage_shape)
+        v_cache = self._v_buffer[layer_id].view(self._storage_shape)
+        if accel.is_npu():
+            indices = out_loc.to(torch.long)
+            k_cache.index_copy_(0, indices, k)
+            v_cache.index_copy_(0, indices, v)
+            return
+
         from minisgl.kernel import store_cache
 
         store_cache(
-            k_cache=self._k_buffer[layer_id].view(self._storage_shape),
-            v_cache=self._v_buffer[layer_id].view(self._storage_shape),
+            k_cache=k_cache,
+            v_cache=v_cache,
             indices=out_loc,
             k=k,
             v=v,

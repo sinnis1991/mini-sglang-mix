@@ -9,7 +9,11 @@ def _get_torch_cuda_version() -> Tuple[int, int] | None:
     import torch
     import torch.version
 
-    if not torch.cuda.is_available() or not torch.version.cuda:
+    if (
+        not hasattr(torch._C, "_cuda_getDeviceCount")
+        or not torch.cuda.is_available()
+        or not torch.version.cuda
+    ):
         return None
     return torch.cuda.get_device_capability()
 
