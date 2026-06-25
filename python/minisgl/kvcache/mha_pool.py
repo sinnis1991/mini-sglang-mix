@@ -48,11 +48,10 @@ class MHAKVCache(BaseKVCachePool):
     ) -> None:
         k_cache = self._k_buffer[layer_id].view(self._storage_shape)
         v_cache = self._v_buffer[layer_id].view(self._storage_shape)
-        if not accel.is_cuda():
+        if accel.is_npu():
             indices = out_loc.to(torch.long)
-            kv_shape = self._storage_shape[1:]
-            k_cache.index_copy_(0, indices, k.view(-1, *kv_shape))
-            v_cache.index_copy_(0, indices, v.view(-1, *kv_shape))
+            k_cache.index_copy_(0, indices, k)
+            v_cache.index_copy_(0, indices, v)
             return
 
         from minisgl.kernel import store_cache
