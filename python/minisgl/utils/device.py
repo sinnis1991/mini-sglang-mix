@@ -36,10 +36,11 @@ def device_type() -> str:
     return _DEVICE_TYPE
 
 
+
 def is_cuda() -> bool:
     return _DEVICE_TYPE == "cuda"
 
-
+  
 def is_npu() -> bool:
     return _DEVICE_TYPE == "npu"
 
