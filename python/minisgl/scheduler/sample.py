@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Iterable, List, Set
 import torch
 from minisgl.core import Req
 from minisgl.message import DetokenizeMsg
+from minisgl.utils import device as accel
 
 if TYPE_CHECKING:
     from .scheduler import Scheduler
@@ -47,8 +48,8 @@ class SampleManager:
         sample_args = scheduler.engine.sampler.prepare_reqs(reqs)
         next_tokens_gpu = scheduler.engine.sampler.sample(logits, sample_args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done = torch.cuda.Event()
-        copy_done.record(torch.cuda.current_stream())
+        copy_done = accel.Event()
+        copy_done.record(accel.current_stream())
         copy_done.synchronize()
 
         mapping = torch.tensor(
@@ -69,9 +70,7 @@ class SampleManager:
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == scheduler.eos_token_id
-                reply.append(
-                    DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished)
-                )
+                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
                 if finished and req not in scheduler.finished_reqs:
                     scheduler.decode_manager.remove_req(req)
