@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Small accelerator runtime wrapper for CUDA and Ascend NPU backends."""
+
 from contextlib import nullcontext
 from typing import Any
 
