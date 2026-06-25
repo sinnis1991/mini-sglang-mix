@@ -5,6 +5,7 @@ import math
 from typing import Any, Callable, Dict, Tuple
 
 import torch
+from minisgl.utils import device as accel
 
 from .base import StateLessOP
 
@@ -32,9 +33,14 @@ class RotaryEmbedding(StateLessOP):
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
 
-        from flashinfer import apply_rope_with_cos_sin_cache_inplace
-
-        self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
+        self.apply_rope_with_cos_sin_cache_inplace = None
+        if accel.is_cuda():
+            try:
+                from flashinfer import apply_rope_with_cos_sin_cache_inplace
+            except ImportError:
+                pass
+            else:
+                self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
 
     def forward(
         self,
@@ -42,14 +48,35 @@ class RotaryEmbedding(StateLessOP):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.apply_rope_with_cos_sin_cache_inplace(
-            positions=positions,
-            query=query,
-            key=key,
-            head_size=self.head_size,
-            cos_sin_cache=self._cos_sin_cache,
+        if self.apply_rope_with_cos_sin_cache_inplace is not None:
+            self.apply_rope_with_cos_sin_cache_inplace(
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                cos_sin_cache=self._cos_sin_cache,
+            )
+            return query, key
+
+        cos_sin = self._cos_sin_cache.to(device=positions.device, dtype=query.dtype).index_select(
+            0, positions.to(torch.long)
         )
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        _apply_rope_native(query, cos, sin, self.head_size)
+        _apply_rope_native(key, cos, sin, self.head_size)
         return query, key
+
+
+def _apply_rope_native(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, head_size: int
+) -> None:
+    original_shape = x.shape
+    x_view = x.view(x.shape[0], -1, head_size)
+    cos = cos.view(cos.shape[0], 1, head_size // 2)
+    sin = sin.view(sin.shape[0], 1, head_size // 2)
+    x1, x2 = x_view[..., : head_size // 2], x_view[..., head_size // 2 :]
+    rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    x.copy_(rotated.view(original_shape))
 
 
 def _get_rope(
@@ -97,7 +124,11 @@ def _get_rope(
             orig_max_pos: int = rope_scaling["original_max_position_embeddings"]
 
             def _find_correction_dim(num_rotations: float) -> float:
-                return rotary_dim * math.log(orig_max_pos / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+                return (
+                    rotary_dim
+                    * math.log(orig_max_pos / (num_rotations * 2 * math.pi))
+                    / (2 * math.log(base))
+                )
 
             low = max(math.floor(_find_correction_dim(beta_fast)), 0)
             high = min(math.ceil(_find_correction_dim(beta_slow)), rotary_dim // 2 - 1)
@@ -105,7 +136,8 @@ def _get_rope(
             def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
                 ramp = torch.clamp(
                     (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / max(high - low, 1),
-                    0, 1,
+                    0,
+                    1,
                 )
                 return (inv_freq / factor) * ramp + inv_freq * (1 - ramp)
 
