@@ -276,6 +276,18 @@ def native_experts_impl(
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1.shape[0] == w2.shape[0], "Expert count mismatch"
 
+    route_count = topk_ids.numel()
+    if route_count <= 256:
+        return native_experts_vectorized_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            apply_router_weight_on_input,
+        )
+
     output = torch.zeros_like(hidden_states)
     act_fn = {"silu": silu_and_mul, "gelu": gelu_and_mul}[activation]
     num_experts = w1.shape[0]
@@ -298,6 +310,40 @@ def native_experts_impl(
             expert_output = expert_output * route_weights.unsqueeze(-1)
         output.index_add_(0, token_ids, expert_output)
 
+    return output
+
+
+def native_experts_vectorized_impl(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+) -> torch.Tensor:
+    from minisgl.layers import gelu_and_mul, silu_and_mul
+
+    output = torch.zeros_like(hidden_states)
+    token_and_route = torch.nonzero(topk_ids >= 0, as_tuple=False)
+    if token_and_route.numel() == 0:
+        return output
+
+    token_ids = token_and_route[:, 0]
+    route_ids = token_and_route[:, 1]
+    expert_ids = topk_ids[token_ids, route_ids].to(torch.long)
+    route_weights = topk_weights[token_ids, route_ids].to(hidden_states.dtype)
+
+    expert_input = hidden_states[token_ids]
+    if apply_router_weight_on_input:
+        expert_input = expert_input * route_weights.unsqueeze(-1)
+
+    gate_up = torch.bmm(w1[expert_ids], expert_input.unsqueeze(-1)).squeeze(-1)
+    act_fn = {"silu": silu_and_mul, "gelu": gelu_and_mul}[activation]
+    expert_output = torch.bmm(w2[expert_ids], act_fn(gate_up).unsqueeze(-1)).squeeze(-1)
+    if not apply_router_weight_on_input:
+        expert_output = expert_output * route_weights.unsqueeze(-1)
+    output.index_add_(0, token_ids, expert_output)
     return output
 
 

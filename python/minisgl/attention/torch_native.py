@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import math
 from dataclasses import dataclass
-from typing import List
+from typing import Callable, List
 
 import torch
 from minisgl.core import Batch, get_global_ctx
@@ -10,6 +12,16 @@ from minisgl.distributed import get_tp_info
 from minisgl.utils import div_even
 
 from .base import BaseAttnBackend, BaseAttnMetadata
+
+
+def _get_npu_fused_infer_attention() -> Callable | None:
+    if importlib.util.find_spec("torch_npu") is None:
+        return None
+    torch_npu = importlib.import_module("torch_npu")
+    npu_fia = getattr(torch_npu, "npu_fused_infer_attention_score", None)
+    if npu_fia is not None:
+        return npu_fia
+    return getattr(getattr(torch.ops, "npu", None), "npu_fused_infer_attention_score_v2", None)
 
 
 @dataclass
@@ -39,6 +51,8 @@ class TorchNativeBackend(BaseAttnBackend):
         self.kv_head_local = div_even(config.num_kv_heads, tp_size, allow_replicate=True)
         self.head_dim = config.head_dim
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.npu_fused_infer_attention = _get_npu_fused_infer_attention()
+        self.npu_fused_infer_attention_disabled = False
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
@@ -59,6 +73,15 @@ class TorchNativeBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, TorchNativeMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+
+        if (
+            self.npu_fused_infer_attention is not None
+            and not self.npu_fused_infer_attention_disabled
+        ):
+            try:
+                return self._forward_npu_fused_attention(q, layer_id, batch, metadata)
+            except Exception:
+                self.npu_fused_infer_attention_disabled = True
 
         k_cache = self.kvcache.k_cache(layer_id).view(-1, self.kv_head_local, self.head_dim)
         v_cache = self.kvcache.v_cache(layer_id).view(-1, self.kv_head_local, self.head_dim)
@@ -93,6 +116,81 @@ class TorchNativeBackend(BaseAttnBackend):
             out = torch.einsum("hqk,khd->qhd", probs, v_req)
             outputs.append(out)
 
+        if not outputs:
+            return q.new_empty((0, self.qo_head_local, self.head_dim))
+        return torch.cat(outputs, dim=0)
+
+    def _forward_npu_fused_attention(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        metadata: TorchNativeMetadata,
+    ) -> torch.Tensor:
+        assert self.npu_fused_infer_attention is not None
+        bs = len(batch.padded_reqs)
+        max_q_len = max(metadata.seqlens_q, default=0)
+        max_k_len = max(metadata.seqlens_k, default=0)
+        if bs == 0 or max_q_len == 0:
+            return q.new_empty((0, self.qo_head_local, self.head_dim))
+
+        k_cache = self.kvcache.k_cache(layer_id).view(-1, self.kv_head_local, self.head_dim)
+        v_cache = self.kvcache.v_cache(layer_id).view(-1, self.kv_head_local, self.head_dim)
+        page_table = get_global_ctx().page_table
+
+        q_padded = q.new_zeros((bs, max_q_len, self.qo_head_local, self.head_dim))
+        k_padded = q.new_zeros((bs, max_k_len, self.kv_head_local, self.head_dim))
+        v_padded = q.new_zeros((bs, max_k_len, self.kv_head_local, self.head_dim))
+        attn_mask = None
+        if batch.is_prefill:
+            attn_mask = torch.ones((bs, 1, max_q_len, max_k_len), dtype=torch.bool, device=q.device)
+
+        q_offset = 0
+        for b, (req, q_len, k_len) in enumerate(
+            zip(batch.padded_reqs, metadata.seqlens_q, metadata.seqlens_k)
+        ):
+            if q_len > 0:
+                q_padded[b, :q_len].copy_(q[q_offset : q_offset + q_len])
+            q_offset += q_len
+
+            indices = page_table[req.table_idx, :k_len].to(torch.long)
+            k_padded[b, :k_len].copy_(k_cache.index_select(0, indices))
+            v_padded[b, :k_len].copy_(v_cache.index_select(0, indices))
+
+            if attn_mask is not None:
+                cached_len = k_len - q_len
+                q_pos = torch.arange(q_len, device=q.device).unsqueeze(1)
+                k_pos = torch.arange(k_len, device=q.device).unsqueeze(0)
+                attn_mask[b, 0, :q_len, :k_len] = k_pos > (cached_len + q_pos)
+
+        kwargs = {
+            "num_heads": self.qo_head_local,
+            "num_key_value_heads": self.kv_head_local,
+            "input_layout": "BSND",
+            "atten_mask": attn_mask,
+            "actual_seq_lengths": metadata.seqlens_q,
+            "actual_seq_lengths_kv": metadata.seqlens_k,
+        }
+        try:
+            attn_output, _ = self.npu_fused_infer_attention(
+                q_padded,
+                k_padded,
+                v_padded,
+                scale=self.scale,
+                **kwargs,
+            )
+        except TypeError:
+            attn_output, _ = self.npu_fused_infer_attention(
+                q_padded,
+                k_padded,
+                v_padded,
+                scale_value=self.scale,
+                **kwargs,
+            )
+
+        outputs = [
+            attn_output[b, :q_len] for b, q_len in enumerate(metadata.seqlens_q) if q_len > 0
+        ]
         if not outputs:
             return q.new_empty((0, self.qo_head_local, self.head_dim))
         return torch.cat(outputs, dim=0)

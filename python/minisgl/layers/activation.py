@@ -47,15 +47,6 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
         return out
     return result
 
-def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
-    if accel.is_cuda():
-        try:
-            from flashinfer import silu_and_mul as flashinfer_silu_and_mul
-        except ImportError:
-            pass
-        else:
-            return flashinfer_silu_and_mul(x, out=out)
-
     gate, up = _split_gate_up(x)
     result = F.silu(gate) * up
     if out is not None:
