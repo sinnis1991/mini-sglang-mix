@@ -47,6 +47,12 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
         return out
     return result
 
+    gate, up = _split_gate_up(x)
+    result = F.silu(gate) * up
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     if accel.is_cuda():
