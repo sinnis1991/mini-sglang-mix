@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 from minisgl.utils import Registry, init_logger
+from minisgl.utils import device as accel
 
 from .base import BaseAttnBackend, BaseAttnMetadata, HybridBackend
 
@@ -40,6 +41,13 @@ def create_fa_backend(config: ModelConfig):
     return FlashAttentionBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("torch")
+def create_torch_backend(config: ModelConfig):
+    from .torch_native import TorchNativeBackend
+
+    return TorchNativeBackend(config)
+
+
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         required_backends = backend.split(",") if "," in backend else [backend]
@@ -54,6 +62,12 @@ def create_attention_backend(
     config: ModelConfig,
 ) -> BaseAttnBackend:
     validate_attn_backend(backend, allow_auto=False)
+    if accel.is_npu() and backend != "torch":
+        logger.warning_rank0(
+            f"Attention backend {backend!r} is CUDA-specific; using PyTorch native backend on NPU."
+        )
+        backend = "torch"
+
     if "," in backend:
         assert backend.count(",") == 1, "Only one comma is allowed in hybrid backend"
         p_backend, d_backend = backend.split(",", 1)
