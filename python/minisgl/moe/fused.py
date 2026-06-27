@@ -1,9 +1,35 @@
 import functools
-from typing import Dict, Tuple
+import importlib
+import importlib.util
+from typing import Callable, Dict, Tuple
 
 import torch
+import torch.nn.functional as F
 from minisgl.moe import BaseMoeBackend
-from minisgl.utils import div_ceil
+from minisgl.utils import device as accel
+from minisgl.utils import div_ceil, init_logger
+
+logger = init_logger(__name__)
+
+
+@functools.cache
+def _get_topk_softmax() -> Callable | None:
+    package = "sgl_kernel" if accel.is_cuda() else "sgl_kernel_npu"
+    if importlib.util.find_spec(package) is None:
+        return None
+    return getattr(importlib.import_module(package), "topk_softmax", None)
+
+
+@functools.cache
+def _get_npu_fused_moe() -> Callable | None:
+    if accel.is_cuda() or importlib.util.find_spec("sgl_kernel_npu") is None:
+        return None
+    module = importlib.import_module("sgl_kernel_npu")
+    for name in ("fused_experts", "fused_moe", "fused_moe_forward"):
+        fn = getattr(module, name, None)
+        if fn is not None:
+            return fn
+    return None
 
 
 def fused_topk(
@@ -13,10 +39,21 @@ def fused_topk(
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sgl_kernel import topk_softmax
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     M, _ = hidden_states.shape
+
+    topk_softmax = _get_topk_softmax()
+    if topk_softmax is None:
+        scores = F.softmax(gating_output.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
+        topk_ids = topk_ids.to(torch.int32)
+        if renormalize:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        if num_token_non_padded is not None:
+            indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+            topk_ids[indices >= num_token_non_padded, :] = -1
+        return topk_weights, topk_ids
+
     topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
     topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
@@ -133,6 +170,17 @@ def fused_experts_impl(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
+    if not accel.is_cuda():
+        return native_experts_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            apply_router_weight_on_input,
+        )
+
     from minisgl.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from minisgl.layers import gelu_and_mul, silu_and_mul
 
@@ -227,7 +275,98 @@ def fused_experts_impl(
     return out_hidden_states
 
 
+def native_experts_impl(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+) -> torch.Tensor:
+    from minisgl.layers import gelu_and_mul, silu_and_mul
+
+    assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert w1.shape[0] == w2.shape[0], "Expert count mismatch"
+
+    route_count = topk_ids.numel()
+    if route_count <= 256:
+        return native_experts_vectorized_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            apply_router_weight_on_input,
+        )
+
+    output = torch.zeros_like(hidden_states)
+    act_fn = {"silu": silu_and_mul, "gelu": gelu_and_mul}[activation]
+    num_experts = w1.shape[0]
+
+    for expert_id in range(num_experts):
+        token_and_route = torch.nonzero(topk_ids == expert_id, as_tuple=False)
+        if token_and_route.numel() == 0:
+            continue
+
+        token_ids = token_and_route[:, 0]
+        route_ids = token_and_route[:, 1]
+        route_weights = topk_weights[token_ids, route_ids].to(hidden_states.dtype)
+        expert_input = hidden_states[token_ids]
+        if apply_router_weight_on_input:
+            expert_input = expert_input * route_weights.unsqueeze(-1)
+
+        gate_up = F.linear(expert_input, w1[expert_id])
+        expert_output = F.linear(act_fn(gate_up), w2[expert_id])
+        if not apply_router_weight_on_input:
+            expert_output = expert_output * route_weights.unsqueeze(-1)
+        output.index_add_(0, token_ids, expert_output)
+
+    return output
+
+
+def native_experts_vectorized_impl(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
+) -> torch.Tensor:
+    from minisgl.layers import gelu_and_mul, silu_and_mul
+
+    output = torch.zeros_like(hidden_states)
+    token_and_route = torch.nonzero(topk_ids >= 0, as_tuple=False)
+    if token_and_route.numel() == 0:
+        return output
+
+    token_ids = token_and_route[:, 0]
+    route_ids = token_and_route[:, 1]
+    expert_ids = topk_ids[token_ids, route_ids].to(torch.long)
+    route_weights = topk_weights[token_ids, route_ids].to(hidden_states.dtype)
+
+    expert_input = hidden_states[token_ids]
+    if apply_router_weight_on_input:
+        expert_input = expert_input * route_weights.unsqueeze(-1)
+
+    gate_up = torch.bmm(w1[expert_ids], expert_input.unsqueeze(-1)).squeeze(-1)
+    act_fn = {"silu": silu_and_mul, "gelu": gelu_and_mul}[activation]
+    expert_output = torch.bmm(w2[expert_ids], act_fn(gate_up).unsqueeze(-1)).squeeze(-1)
+    if not apply_router_weight_on_input:
+        expert_output = expert_output * route_weights.unsqueeze(-1)
+    output.index_add_(0, token_ids, expert_output)
+    return output
+
+
 class FusedMoe(BaseMoeBackend):
+    def __init__(self) -> None:
+        self.npu_fused_moe = _get_npu_fused_moe()
+        self.npu_fused_moe_disabled = False
+        self.npu_fused_moe_logged = False
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -239,6 +378,31 @@ class FusedMoe(BaseMoeBackend):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
     ) -> torch.Tensor:
+        if self.npu_fused_moe is not None and not self.npu_fused_moe_disabled:
+            try:
+                if not self.npu_fused_moe_logged:
+                    logger.info_rank0(
+                        "Using sgl_kernel_npu fused MoE in FusedMoe: %s",
+                        self.npu_fused_moe,
+                    )
+                    self.npu_fused_moe_logged = True
+                return self.npu_fused_moe(
+                    hidden_states=hidden_states,
+                    w1=w1,
+                    w2=w2,
+                    gating_output=gating_output,
+                    topk=topk,
+                    renormalize=renormalize,
+                    activation=activation,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                )
+            except Exception as exc:
+                logger.warning_rank0(
+                    "Disabling sgl_kernel_npu fused MoE after runtime failure: %s",
+                    exc,
+                )
+                self.npu_fused_moe_disabled = True
+
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=gating_output,
