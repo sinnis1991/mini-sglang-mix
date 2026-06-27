@@ -32,6 +32,14 @@ def _get_npu_fused_moe() -> Callable | None:
     return None
 
 
+@functools.cache
+def _get_topk_softmax() -> Callable | None:
+    package = "sgl_kernel" if accel.is_cuda() else "sgl_kernel_npu"
+    if importlib.util.find_spec(package) is None:
+        return None
+    return getattr(importlib.import_module(package), "topk_softmax", None)
+
+
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
