@@ -9,9 +9,11 @@ from typing import Callable, List
 import torch
 from minisgl.core import Batch, get_global_ctx
 from minisgl.distributed import get_tp_info
-from minisgl.utils import div_even
+from minisgl.utils import div_even, init_logger
 
 from .base import BaseAttnBackend, BaseAttnMetadata
+
+logger = init_logger(__name__)
 
 
 def _get_npu_fused_infer_attention() -> Callable | None:
@@ -53,6 +55,7 @@ class TorchNativeBackend(BaseAttnBackend):
         self.scale = 1.0 / math.sqrt(self.head_dim)
         self.npu_fused_infer_attention = _get_npu_fused_infer_attention()
         self.npu_fused_infer_attention_disabled = False
+        self.npu_fused_infer_attention_logged = False
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
@@ -79,8 +82,18 @@ class TorchNativeBackend(BaseAttnBackend):
             and not self.npu_fused_infer_attention_disabled
         ):
             try:
+                if not self.npu_fused_infer_attention_logged:
+                    logger.info_rank0(
+                        "Using NPU fused infer attention in TorchNativeBackend: %s",
+                        self.npu_fused_infer_attention,
+                    )
+                    self.npu_fused_infer_attention_logged = True
                 return self._forward_npu_fused_attention(q, layer_id, batch, metadata)
-            except Exception:
+            except Exception as exc:
+                logger.warning_rank0(
+                    "Disabling NPU fused infer attention after runtime failure: %s",
+                    exc,
+                )
                 self.npu_fused_infer_attention_disabled = True
 
         k_cache = self.kvcache.k_cache(layer_id).view(-1, self.kv_head_local, self.head_dim)
