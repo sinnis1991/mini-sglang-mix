@@ -1,12 +1,21 @@
 import functools
+import importlib
 import importlib.util
-from typing import Dict, Tuple
+from typing import Callable, Dict, Tuple
 
 import torch
 import torch.nn.functional as F
 from minisgl.moe import BaseMoeBackend
 from minisgl.utils import device as accel
 from minisgl.utils import div_ceil
+
+
+@functools.cache
+def _get_topk_softmax() -> Callable | None:
+    package = "sgl_kernel" if accel.is_cuda() else "sgl_kernel_npu"
+    if importlib.util.find_spec(package) is None:
+        return None
+    return getattr(importlib.import_module(package), "topk_softmax", None)
 
 
 def fused_topk(
@@ -19,7 +28,8 @@ def fused_topk(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     M, _ = hidden_states.shape
 
-    if not accel.is_cuda() or importlib.util.find_spec("sgl_kernel") is None:
+    topk_softmax = _get_topk_softmax()
+    if topk_softmax is None:
         scores = F.softmax(gating_output.float(), dim=-1)
         topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
         topk_ids = topk_ids.to(torch.int32)
@@ -29,8 +39,6 @@ def fused_topk(
             indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
             topk_ids[indices >= num_token_non_padded, :] = -1
         return topk_weights, topk_ids
-
-    from sgl_kernel import topk_softmax
 
     topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
