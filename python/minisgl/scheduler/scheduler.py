@@ -12,6 +12,7 @@ from minisgl.message import (
     ExitMsg,
     UserMsg,
 )
+from minisgl.utils import device as accel
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -50,9 +51,9 @@ class Scheduler(SchedulerIOMixin):
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
-        self.stream = torch.cuda.Stream(device=self.device)
-        self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
-        torch.cuda.set_stream(self.stream)
+        self.stream = accel.Stream(device=self.device)
+        self.engine_stream_ctx = accel.stream(self.engine.stream)
+        accel.set_stream(self.stream)
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
@@ -109,7 +110,9 @@ class Scheduler(SchedulerIOMixin):
 
     def normal_loop(self) -> None:
         blocking = not (
-            self.sample_manager.runnable or self.prefill_manager.runnable or self.decode_manager.runnable
+            self.sample_manager.runnable
+            or self.prefill_manager.runnable
+            or self.decode_manager.runnable
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -129,13 +132,13 @@ class Scheduler(SchedulerIOMixin):
                 while True:
                     self.normal_loop()
         else:
-            assert torch.cuda.current_stream() == self.stream
+            assert accel.current_stream() == self.stream
             data = None
             while True:
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
-        torch.cuda.synchronize(self.device)
+        accel.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
 

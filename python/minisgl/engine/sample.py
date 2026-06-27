@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
+from minisgl.utils import device as accel
 from minisgl.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
@@ -21,28 +22,81 @@ def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> 
     return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
 
 
+def _native_sample_from_probs(probs: torch.Tensor) -> torch.Tensor:
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
+def _apply_top_k(logits: torch.Tensor, top_k: torch.Tensor | int | None) -> torch.Tensor:
+    if top_k is None:
+        return logits
+    if isinstance(top_k, int):
+        top_k = torch.full((logits.shape[0],), top_k, dtype=torch.int64, device=logits.device)
+    top_k = top_k.to(device=logits.device, dtype=torch.int64).clamp(min=1, max=logits.shape[-1])
+    filtered = torch.full_like(logits, float("-inf"))
+    for i, k in enumerate(top_k.tolist()):
+        values, indices = torch.topk(logits[i], k)
+        filtered[i].scatter_(0, indices, values)
+    return filtered
+
+
+def _apply_top_p(logits: torch.Tensor, top_p: torch.Tensor | float | None) -> torch.Tensor:
+    if top_p is None:
+        return logits
+    if isinstance(top_p, float):
+        top_p = torch.full((logits.shape[0],), top_p, dtype=torch.float32, device=logits.device)
+    top_p = top_p.to(device=logits.device, dtype=torch.float32).clamp(min=0.0, max=1.0)
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+    sorted_probs = torch.softmax(sorted_logits.float(), dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    remove = cumulative_probs > top_p[:, None]
+    remove[:, 1:] = remove[:, :-1].clone()
+    remove[:, 0] = False
+    sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+    filtered = torch.full_like(logits, float("-inf"))
+    filtered.scatter_(1, sorted_indices, sorted_logits)
+    return filtered
+
+
+def _native_sample_impl(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor | int | None,
+    top_p: torch.Tensor | float | None,
+) -> torch.Tensor:
+    logits = logits / temperatures[:, None].to(logits.device)
+    logits = _apply_top_k(logits, top_k)
+    logits = _apply_top_p(logits, top_p)
+    return _native_sample_from_probs(torch.softmax(logits.float(), dim=-1))
+
+
 def sample_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
 ) -> torch.Tensor:
-    import flashinfer.sampling as sampling
+    if accel.is_cuda():
+        try:
+            import flashinfer.sampling as sampling
+        except ImportError:
+            pass
+        else:
+            probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
+            if top_k is None and top_p is None:
+                return sampling.sampling_from_probs(probs)
 
-    probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
-    if top_k is None and top_p is None:
-        return sampling.sampling_from_probs(probs)
+            if top_p is None:
+                assert top_k is not None
+                return sampling.top_k_sampling_from_probs(probs, top_k)
 
-    if top_p is None:
-        assert top_k is not None
-        return sampling.top_k_sampling_from_probs(probs, top_k)
+            if top_k is None:
+                assert top_p is not None
+                return sampling.top_p_sampling_from_probs(probs, top_p)
 
-    if top_k is None:
-        assert top_p is not None
-        return sampling.top_p_sampling_from_probs(probs, top_p)
+            assert top_k is not None and top_p is not None
+            return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
 
-    assert top_k is not None and top_p is not None
-    return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+    return _native_sample_impl(logits, temperatures, top_k, top_p)
 
 
 @dataclass
@@ -72,7 +126,7 @@ class Sampler:
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
-        with torch.cuda.nvtx.range("Sampler"):
+        with accel.nvtx_range("Sampler"):
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
             return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
