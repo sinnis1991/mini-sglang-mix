@@ -111,7 +111,17 @@ class Engine:
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
+        if config.tp_info.size == 1:
+            torch.distributed.init_process_group(
+                backend="gloo",
+                rank=config.tp_info.rank,
+                world_size=config.tp_info.size,
+                timeout=timedelta(seconds=config.distributed_timeout),
+                init_method=config.distributed_addr,
+            )
+            tp_cpu_group = torch.distributed.group.WORLD
+            assert tp_cpu_group is not None
+        elif config.use_pynccl and accel.is_cuda():
             torch.distributed.init_process_group(
                 backend="gloo",
                 rank=config.tp_info.rank,
@@ -126,8 +136,9 @@ class Engine:
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
+            backend = "hccl" if accel.is_npu() else "nccl"
             torch.distributed.init_process_group(
-                backend="nccl",
+                backend=backend,
                 rank=config.tp_info.rank,
                 world_size=config.tp_info.size,
                 timeout=timedelta(seconds=config.distributed_timeout),
