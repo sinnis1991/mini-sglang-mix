@@ -7,7 +7,29 @@ import torch
 import torch.nn.functional as F
 from minisgl.moe import BaseMoeBackend
 from minisgl.utils import device as accel
-from minisgl.utils import div_ceil
+from minisgl.utils import div_ceil, init_logger
+
+logger = init_logger(__name__)
+
+
+@functools.cache
+def _get_topk_softmax() -> Callable | None:
+    package = "sgl_kernel" if accel.is_cuda() else "sgl_kernel_npu"
+    if importlib.util.find_spec(package) is None:
+        return None
+    return getattr(importlib.import_module(package), "topk_softmax", None)
+
+
+@functools.cache
+def _get_npu_fused_moe() -> Callable | None:
+    if accel.is_cuda() or importlib.util.find_spec("sgl_kernel_npu") is None:
+        return None
+    module = importlib.import_module("sgl_kernel_npu")
+    for name in ("fused_experts", "fused_moe", "fused_moe_forward"):
+        fn = getattr(module, name, None)
+        if fn is not None:
+            return fn
+    return None
 
 
 @functools.cache
@@ -348,6 +370,11 @@ def native_experts_vectorized_impl(
 
 
 class FusedMoe(BaseMoeBackend):
+    def __init__(self) -> None:
+        self.npu_fused_moe = _get_npu_fused_moe()
+        self.npu_fused_moe_disabled = False
+        self.npu_fused_moe_logged = False
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -359,6 +386,31 @@ class FusedMoe(BaseMoeBackend):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
     ) -> torch.Tensor:
+        if self.npu_fused_moe is not None and not self.npu_fused_moe_disabled:
+            try:
+                if not self.npu_fused_moe_logged:
+                    logger.info_rank0(
+                        "Using sgl_kernel_npu fused MoE in FusedMoe: %s",
+                        self.npu_fused_moe,
+                    )
+                    self.npu_fused_moe_logged = True
+                return self.npu_fused_moe(
+                    hidden_states=hidden_states,
+                    w1=w1,
+                    w2=w2,
+                    gating_output=gating_output,
+                    topk=topk,
+                    renormalize=renormalize,
+                    activation=activation,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                )
+            except Exception as exc:
+                logger.warning_rank0(
+                    "Disabling sgl_kernel_npu fused MoE after runtime failure: %s",
+                    exc,
+                )
+                self.npu_fused_moe_disabled = True
+
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=gating_output,
